@@ -1,0 +1,502 @@
+public without sharing class NotificationUtil {
+
+  private static Notification_Settings__c settings;
+    @testVisible
+    private static Id orgWideEmailId;
+    
+  private static map<string, Notification_Types__c> NotificationTypeMap = new map<string, Notification_Types__c>();
+  private static id IncomingPackageRecordTypeId;
+  static {
+    settings = Notification_Settings__c.getOrgDefaults();
+        if(settings.Org_Wide_Email_Address__c != Null){
+            // query the email address from the custom setting to make sure it exists.
+            try{
+                orgWideEmailId = [SELECT Id FROM OrgWideEmailAddress WHERE Address = :settings.Org_Wide_Email_Address__c].Id;
+            }catch(Exception e){}
+        }
+        system.debug('orgWideEmailId : ' + orgWideEmailId);
+    map<String, Schema.SObjectType> gd = Schema.getGlobalDescribe();
+    for(Notification_Types__c notif : Notification_Types__c.getAll().values()) {
+      if(gd.containsKey(notif.SObject__c)) {
+        string prefix = gd.get(notif.SObject__c).getDescribe().getKeyPrefix();
+        NotificationTypeMap.put(prefix, notif);
+      }
+    }
+    IncomingPackageRecordTypeId = Schema.SObjectType.Case.getRecordTypeInfosByName().get('Incoming Package').getRecordTypeId();
+  }  
+  
+  public static void NotifyCampaignsIfReady(list<Campaign_Notification__c> newList, map<id, Campaign_Notification__c> oldMap) {
+    set<id> campaignIds = new set<id>(); 
+    for (Campaign_Notification__c newCn : newList) {
+      Campaign_Notification__c oldCn = oldMap.get(newCn.id);
+      if (oldCn.status__c != 'Ready' && newCn.status__c == 'Ready') {
+        CreateCampaignMembersFromCriteria(newCn.Campaign__c);
+        campaignIds.add(newCn.Campaign__c);
+      }
+    }
+    if(campaignIds.size()>0) {
+      CampaignNotificationBatcher.NotifyCampaigns(campaignIds);
+    }
+  }
+    
+    public static void NotifyCampaignsImmediate(list<Campaign_Notification__c> cns){
+        set<id> campaignIds = new set<id>(); 
+    for (Campaign_Notification__c newCn : cns) {
+      if (newCn.status__c == 'Ready' && newCn.Alert_Subject__c != null) {
+        CreateCampaignMembersFromCriteria(newCn.Campaign__c);
+                CreateInternalMembers(newCn);
+        campaignIds.add(newCn.Campaign__c);
+      }
+    }
+    if(campaignIds.size()>0) {
+      CampaignNotificationBatcher.NotifyCampaigns(campaignIds);
+    }
+    }
+  
+  public static void NotifyProperty(id propId, string message, id recordid) {
+    NotifyProperty(propId, message, recordid, null);  
+  }
+  
+  /*******************************************************************************************************
+    * @description        Send push and/or email notification to tenants of a property 
+    * @param propId       The property to notify
+    * @param message      Push notification message text, can be used in email template with $message
+    * @param recordid     optional related record id to include in push notification; used as WhatId in email
+    * @param recipientId  optional tenantid of intented recipient.  When not-null, notifications will not 
+    *                     be sent to other tenants of the property whose Limit_Package_Notifications__c=true  
+    */
+  public static void NotifyProperty(id propId, string message, id recordid, id recipientId) {
+    Notification_Types__c notifyType;
+    string prefix = ((string)recordId).left(3);
+    if(recordId!=null && NotificationTypeMap.containsKey(prefix)) {
+      notifyType = NotificationTypeMap.get(prefix);
+      system.debug('Notify Property: Notification Type' + notifyType);
+    }
+    else {
+      //don't recognize this record type for notification
+      //Future: default notification instead of aborting?
+      system.debug('Notify Property: Unrecognized SObject ' + recordid);
+      return;
+    } 
+    
+    // identify property's contacts from current_tenant object 
+    list<id> contactIds = new list<id>(); 
+    for (Current_Tenant__c ct : [
+       select id, Contact__r.PersonContactId, Limit_Package_Notifications__c
+         from Current_Tenant__c 
+        where Property__c =:propId 
+         and Lease_Start_Date__c <= TODAY
+         and Lease_End_Date__c >= TODAY
+    ]) {
+      // include a tenant (contact) if no recipient specified, or if tenant has no set "limit package notifications", or if tenant is recipient 
+      if (recipientId == null || ct.Limit_Package_Notifications__c==false || ct.id == recipientId) {
+        contactIds.add(ct.Contact__r.PersonContactId);
+      }
+    }
+        
+    set<string> pushIds = new set<string>();  // userIds for push notification.  must be set<string> not id, as push methods expect set<string>
+    set<id> emailIds = new set<id>();      // userIds for email
+    set<string> smsNumbers = new set<string>(); // mobile numbers for sms
+    for (User u :[
+      select id, contactid, contact.name, contact.email, contact.Use_email_for__c, contact.Use_Push_Notification_for__c
+        from User
+       where contactid in :contactIds
+    ]) {
+      if (u.contact.Use_Push_Notification_for__c != null && u.contact.Use_Push_Notification_for__c.contains(notifyType.name)) {
+        pushIds.add(u.id);
+      }
+      if (u.contact.Use_email_for__c != null && u.contact.Use_email_for__c.contains(notifyType.name)){
+        emailIds.add(u.id);
+      }
+    }
+    
+    system.debug('Notify Property: will email: ' + emailIds);
+    system.debug('Notify Property: will push: ' + pushIds);
+    
+    if (pushIds.size()>0) {
+      string url = notifyType.Push_URL_Template__c;
+      if (url!=null) {
+        url = url.replace('$PROPID', propId);
+        url = url.replace('$ID', recordId);
+      }
+      PushNotifyUsers(pushIds, message, url);
+    }
+    if (emailIds.size()>0) {
+      if (notifyType.Email_Template__c != null) { 
+        EmailNotifyUsers(emailIds, message, recordId, notifyType.Email_Template__c);
+      }
+      else {
+        system.debug('Did not send email notification for record ' + recordid + '; missing email Template');
+
+      }
+    }
+  }
+  
+  //assumes 2000 users or fewer; does not partition into smaller batches
+  public static void PushNotifyUsers(set<string> userIds, string message, string targetUrl) {
+    system.debug('PushNotifyUsers called for users ' + userIds);
+    system.debug('PushNotifyUsers called with message ' + message);
+    system.debug('PushNotifyUsers called with targetUrl ' + targetUrl);
+    Messaging.PushNotification msg = new Messaging.PushNotification();
+    //Android
+    map<string, object> payload = new map<string, object> {
+      'targetUrl' => targetUrl,
+      'message' => message
+    };
+    msg.setPayload(payload);
+    msg.send('Stonehenge_Mobile_for_Android', userIds);
+    
+    //Apple
+    map<string, object> applePayload = Messaging.PushNotificationPayload.apple(message, 'default', 1, payload);
+    msg.setPayload(applePayload);
+    msg.send('Stonehenge_Mobile_for_iOS', userIds);
+  }
+
+  //assumes reasonable number of userIds, does no partioning
+  private static void EmailNotifyUsers(set<id> userIds, string message, id recordId, string templateName) {
+
+    list<EmailTemplate> templates = [select id, developerName from EmailTemplate where developerName = :templateName];
+    if (templates.size()==0) {
+      system.debug('Did not send email notification for record ' + recordid + '; no email Template "' + templateName + '"');
+      return;
+    }
+
+    list<Messaging.SingleEmailMessage> emails = new list<Messaging.SingleEmailMessage>();
+    list<Messaging.SingleEmailMessage> dummyemails = new list<Messaging.SingleEmailMessage>();
+
+    map<id, id> userToContactMap = new map<id, id>();
+    map<id, id> contactToUsermap = new map<id, id>();
+    
+    for (User u : [select id, contactId from user where id in :userIds]) {
+      userToContactMap.put(u.id, u.contactId);
+      contactToUserMap.put(u.contactId, u.id);
+    }
+
+    for (id uid : userIds) {
+      Messaging.SingleEMailMessage dummy = new Messaging.SingleEMailMessage();
+      dummy.setTargetObjectId(userToContactMap.get(uid));
+      dummy.setTemplateId(templates[0].id);
+      dummy.setWhatId(recordId);
+            if(orgWideEmailId != null){
+        dummy.setOrgWideEmailAddressId(orgWideEmailId);
+            }
+      dummy.setSaveAsActivity(false); // required any time the recipient is a user
+      dummyEmails.add(dummy);      
+    }
+
+    if (dummyEmails.size()>0) {
+      // this is part of the apex email workaround, see comment block above
+      try {
+          Savepoint sp = Database.setSavepoint();
+          //this causes the emails to be parsed.
+          Messaging.sendEmail(dummyEmails);
+          //we don't actually want to send the email to the owner, so rollback.
+          Database.rollback(sp);
+        }
+        catch (Exception ex) {
+          system.debug('Caught Exception: ' + ex);
+        }
+
+      for (Messaging.singleEmailMessage dummy : dummyEmails) {
+
+        id contactId = dummy.getTargetObjectId();
+        id userId = contactToUserMap.get(contactId);
+        Messaging.SingleEMailMessage email = new Messaging.SingleEMailMessage();
+        if (dummy.getPlainTextBody()!=null) {
+          email.setPlainTextBody(dummy.getPlainTextBody().replace('$message', message));
+        }
+        if (dummy.getHtmlBody()!=null) {
+          email.setHtmlBody(dummy.getHtmlBody().replace('$message', message));
+        }
+        if (dummy.getSubject()!=null) {
+          email.setSubject(dummy.getSubject().replace('$message', message));
+        }
+        email.setTargetObjectId(userId);
+                // Doorman Community Updates: 7/27/2015: Jason Benkert @Fortimize
+                // Package emails should come from the org wide email address & not the Doorman's email
+                // Uncommenting the following line
+                if(orgWideEmailId != null){
+                    email.setOrgWideEmailAddressId(orgWideEmailId);
+                }
+        email.setSaveAsActivity(false); // required any time the recipient is a user
+        emails.add(email);
+      }
+    }
+    if (emails.size()>0) {
+system.debug('sending emails: ' + emails);      
+      Messaging.sendEmail(emails, false);
+    }
+    
+  }
+
+  private static string getNextTextMsgNumber() {
+    list<Text_Msg_Number__c> nums = [select Phone_Number__c, Last_Used__c from Text_Msg_Number__c order by Last_Used__c ASC NULLS FIRST LIMIT 1];
+    if(nums.size()==0) return null;
+    Text_Msg_Number__c num = nums[0];
+    num.Last_Used__c = DateTime.now();
+    update num;
+    return num.Phone_Number__c;
+  }
+  
+  public static void SendVisitorQRCode(id visitorAccessId) {
+    if(settings.Doorman_Base_URL__c == null || settings.QR_URL_Template__c == null || settings.Visitor_SMS_Template__c == null) {
+      system.debug(LoggingLevel.ERROR, 'Could not send visitor QR Code - missing Notification Settings');
+      return;
+    }
+    string textFromNumber = getNextTextMsgNumber();
+    if (textFromNumber==null) {
+      system.debug(LoggingLevel.ERROR, 'Could not send visitor QR Code - missing "From" Number.  Check Text_Msg_Number__c.');
+      return;
+    }
+     SendVisitorQRCode(visitorAccessId, textFromNumber);
+  }
+  
+  @future (callout=true)
+  private static void SendVisitorQRCode(id visitorAccessId, string textFromNumber) {
+    Visitor_Access__c visitor = [
+      select Id, Access_Granted_To__c, Start_Date__c, End_Date__c, Number_of_Guests__c, Mobile_Phone__c, 
+             Tenant__c, Status__c, Authorizing_Tenant__c,
+             Property__r.Property_Name_Friendly__c, Property__r.Unit_Number__c 
+        from Visitor_Access__c
+       where id = :visitorAccessId
+    ];
+    
+    if(visitor.status__c == StnhgAPI.PROPERTY_ACCESS_ACTIVE && visitor.Mobile_Phone__c != null) {
+      TwilioRestClient client = TwilioAPI.getDefaultClient();
+      
+      string message = settings.Visitor_SMS_Template__c
+                  .replace('$TENANT', visitor.Authorizing_Tenant__c)
+                    .replace('$UNIT', visitor.Property__r.Unit_Number__c)
+                    .replace('$PROPERTY', visitor.Property__r.Property_Name_Friendly__c)
+                    .replace('$START', visitor.Start_Date__c.format());
+                     
+      string checkinUrl = '/CheckinVisitor?id=' + visitor.id;
+      string qrUrl = getQRCode(checkinUrl);
+      
+      Map<String,String> params = new Map<String,String> {
+              'To'   => visitor.Mobile_Phone__c,
+              'From' => textFromNumber,
+              'Body' => message,
+              'MediaUrl' => qrUrl
+          };
+      if (!StnhgUtil.isSandbox() || settings.Send_Messages_From_Sandbox__c) { 
+        TwilioMessage sms = client.getAccount().getMessages().create(params);
+      }
+      else {
+        system.debug(LoggingLevel.INFO, 'SMS not sent from Sandbox: ' + params);
+      }
+    }
+    else {
+      system.debug(LoggingLevel.WARN, 'Cannot send MMS for Visitor Access ' + visitorAccessId + ' - Not active or no mobile number.');
+    }
+  }
+
+  // get an URL for a QRCode representing value param
+  public static string getQRCode(string value) {
+    return settings.QR_URL_Template__c==null ? null : settings.QR_URL_Template__c.replace('$VALUE',EncodingUtil.urlEncode(value, 'UTF-8'));
+  }
+
+    public static void CreateInternalMembers(Campaign_Notification__c newCN){
+        list<Campaign> campaigns = [
+      select id, name, scope__c,
+           (select id, building__c, zone__c from Campaign_Criterion__r) 
+        from Campaign 
+       where id = :newCN.Campaign__c
+    ];
+        list<CampaignMember> members = new list<CampaignMember>();
+        list<Id> zoneIds = new list<Id>();
+        if(campaigns.size() > 0){
+          Campaign camp = campaigns[0];
+            set<Id> buildingIds = new set<Id>();
+            for(Campaign_Criteria__c cc : camp.Campaign_Criterion__r) {
+        if (cc.Building__c!=null) {
+          buildingIds.add(cc.Building__c);
+                }
+      }
+            
+            system.assertEquals(1, buildingIds.size(),'There should only be 1 building for a Building Alert.');
+            list<Id> idList = new list<Id>();
+            idList.addAll(buildingIds);
+            Id bId = idList[0];
+            
+            Building__c bldng = [SELECT Assistant_Property_Manager__c, Property_Manager__c, Superintendant__c, Billing_Contact_Info__c, 
+                             Renewal_Leasing_Agent__c 
+                             FROM Building__c 
+                             WHERE Id = :bId LIMIT 1];
+            system.debug('bldng: ' + bldng);
+            list<Id> uIds = new list<Id>();
+            if(bldng.Assistant_Property_Manager__c != null){
+                uIds.add(bldng.Assistant_Property_Manager__c);
+            }
+            if(bldng.Property_Manager__c != null){
+                uIds.add(bldng.Property_Manager__c);
+            }
+            if(bldng.Superintendant__c != null){
+                uIds.add(bldng.Superintendant__c);
+            }
+            if(bldng.Billing_Contact_Info__c != null){
+                uIds.add(bldng.Billing_Contact_Info__c);
+            }
+            if(bldng.Renewal_Leasing_Agent__c != null){
+                uIds.add(bldng.Renewal_Leasing_Agent__c);
+            }
+            list<Id> cIds = new list<Id>();
+            // also get contactIds from Doorman Assignments.
+            for(Doorman_Assignment__c da: [SELECT Doorman__c FROM Doorman_Assignment__c WHERE Building__c = :bId]){
+                cIds.add(da.Doorman__c);
+            }
+            if(!uIds.isEmpty()){
+                for(Contact con:[SELECT Id, Notifications_For__c, Name FROM Contact 
+                                 WHERE Notifications_For__c IN :uIds OR Id IN :cIds]){
+                    system.debug('adding contact: ' + con.Name);
+                    members.add(new CampaignMember(
+                        ContactId = con.Id,
+                        CampaignId = newCN.Campaign__c
+                    ));
+                }
+            }
+            // add the Doormen
+            
+            if(!members.isEmpty()){
+                insert members;
+            }
+        }
+    }
+  public static void createCampaignMembersFromCriteria(id campaignId) {
+    list<Campaign> campaigns = [
+      select id, name, scope__c,
+           (select id, building__c, zone__c from Campaign_Criterion__r) 
+        from Campaign 
+       where id = :campaignId
+    ];
+    if (campaigns.size()==0) {
+      system.debug(LoggingLevel.WARN, 'createCampaignMembersFromCriteria: no such campaign ' + campaignId);
+      return;
+    }
+    Campaign c = campaigns[0];
+    list<CampaignMember> membersToAdd = new list<CampaignMember>();        // Member records to insert
+    map<id, CampaignMember> existingMembers = new map<id, CampaignMember>();  // Members before this runs; removed from map if found by criteria.  Anyone left, delete Member record.
+    set<id> checkedMembers = new set<id>();    // Track members who have been checked.  Prevent adding same member > 1x  
+    for (CampaignMember member : [select id, ContactId from CampaignMember where CampaignId=:c.id]) {
+      existingMembers.put(member.ContactId, member);
+    }
+        system.debug('existingMembers: ' + existingMembers);
+    if (c.scope__c == 'All Buildings') {
+      // create campaign member for every current tenant
+      for (Current_Tenant__c ct : [
+        select Contact__r.PersonContactId
+          from Current_Tenant__c
+         where Lease_Start_Date__c <= TODAY
+           and Lease_End_Date__c >= TODAY
+      ]) {
+        id contactId = ct.Contact__r.PersonContactId;
+        if (checkedMembers.contains(contactId)) {
+          // Take no action
+        }
+        else if (existingMembers.containsKey(contactId)) {
+          existingMembers.remove(contactId);
+        }
+        else {
+          membersToAdd.add(new CampaignMember(ContactId = contactId, CampaignId = c.id, Status = 'Sent'));
+        }
+        checkedMembers.add(contactId);
+      }
+    }
+    else if (c.scope__c == 'Select Buildings/Zones') {
+      // create campaign member for each criterion
+      list<id> buildingIds = new list<id>();
+      list<id> zoneIds = new list<id>();
+      for(Campaign_Criteria__c cc : c.Campaign_Criterion__r) {
+        if (cc.Zone__c!=null) {
+          zoneIds.add(cc.Zone__c);
+        }
+        else if (cc.Building__c!=null) {
+          buildingIds.add(cc.Building__c);
+        }
+      }
+      for (Current_Tenant__c ct : [
+        select Contact__r.PersonContactId
+          from Current_Tenant__c
+         where Lease_Start_Date__c <= TODAY
+           and Lease_End_Date__c >= TODAY
+           and ( Property__r.Building__c in :buildingIds
+              or Property__r.Floor__c in :zoneIds
+              or Property__r.Line__c in :zoneIds )            
+      ]) {
+        id contactId = ct.Contact__r.PersonContactId;
+        if (checkedMembers.contains(contactId)) {
+          // Take no action
+        }
+        else if (existingMembers.containsKey(contactId)) {
+          existingMembers.remove(contactId);
+        }
+        else {
+          membersToAdd.add(new CampaignMember(ContactId = contactId, CampaignId = c.id, Status = 'Sent'));
+        }
+        checkedMembers.add(contactId);
+      }
+    }
+    else {
+      system.debug(LoggingLevel.WARN, 'createCampaignMembersFromCriteria: Cannot create campaign members for campaign scope ' + c.scope__c + '(Campaign Id: ' + campaignId + ')');
+      return;
+    }
+
+    if (existingMembers.size()>0) {
+      delete existingMembers.values();
+    }
+    if (membersToAdd.size()>0) {
+      insert membersToAdd;
+      
+    }    
+  }
+
+  public static void sendVisitorNotification(id visitorAccessId) {
+    list<Visitor_Access__c> visitors = [select id, Access_Granted_To__c, property__c, property__r.Unit_Number__c, property__r.Property_Name_Friendly__c from Visitor_Access__c where id = :visitorAccessId];
+    if (visitors.size()==0) {
+      system.debug(LoggingLevel.WARN, 'No visitor access notification sent, no such visitor (' + visitorAccessId+ ')');
+    }
+    Visitor_Access__c v = visitors[0];
+
+    System.debug('#### v: '+v);
+    System.debug('#### v.Access_Granted_To__c: '+v.Access_Granted_To__c);
+    System.debug('#### v.property__c: '+v.Property__c);
+    System.debug('#### v.property__r.Property_Name_Friendly__c: '+v.Property__r.Property_Name_Friendly__c);
+    System.debug('#### v.property__r.Unit_Number__c: '+v.Property__r.Unit_Number__c);
+
+    String nm = String.isNotEmpty(v.Access_Granted_To__c) ? v.Access_Granted_To__c: 'Person';
+    String bld = ( String.isNotEmpty(v.Property__c) && String.isNotEmpty(v.property__r.Property_Name_Friendly__c) ) ? v.property__r.Property_Name_Friendly__c: 'Building';
+    String unt = ( String.isNotEmpty(v.Property__c) && String.isNotEmpty(v.property__r.Unit_Number__c) ) ? v.property__r.Unit_Number__c: 'Unit';
+
+    string message = 'Your visitor $NAME has checked in to at $BUILDING $UNIT';
+    message = message.replace('$NAME', nm)
+               .replace('$BUILDING', bld)
+               .replace('$UNIT', unt);
+    NotifyProperty(v.property__c, message, visitorAccessId);
+  }
+
+  public static void sendInboundPackageNotification(id caseId) {
+    list<Case> cases = [select id, Property_Lookup__c, package_type__c, Current_Tenant__c, Notification__c from case where id= :caseId];
+    if (cases.size()==0) {
+      system.debug(LoggingLevel.WARN, 'No package notification sent, no such case (' + caseId+ ')');
+    }
+    Case c = cases[0];
+    string message = c.Notification__c=='Initial' ? 'You have received a package' : 'Reminder: You have received a package';
+    string packageType = c.package_type__c;
+    if (!String.isBlank(packageType)) {
+      message += ' (' + packageType + ')';
+    }
+        system.debug('calling notify property: ' + message);
+    NotifyProperty(c.Property_Lookup__c, message, caseId, c.current_tenant__c);
+    c.Notification__c = null;
+    update c;
+  }
+
+  public static void NotifyInboundPackage(list<Case> newList) {
+    for (Case c : newList) {
+      if (c.recordTypeid == IncomingPackageRecordTypeId && !c.isClosed) {
+        c.Notification__c = 'Initial';
+      }
+    }
+  }
+  
+}
